@@ -32,6 +32,11 @@ with the checks given.
 
 _Added as levers are measured._
 
+- ⭐ **No histograms on the Senzing schema** — `METHOD_OPT = 'FOR ALL COLUMNS SIZE 1'`. A histogram on a generated
+  ID column can switch the hottest lookup to a full table scan whose cost grows with the table.
+  [Details](#-no-histograms-on-the-senzing-schema)
+- **Keep the maintenance-window resource plan out of a load.** [Details](#keep-the-maintenance-window-resource-plan-out-of-a-load)
+
 ---
 
 # Senzing settings for Oracle
@@ -62,6 +67,100 @@ ALTER TABLE RES_ENT ADD FEATURES CLOB;
 ```sql
 SELECT RES_ENT_ID FROM RES_ENT WHERE FEATURES IS NOT NULL FETCH FIRST 5 ROWS ONLY;
 ```
+
+---
+
+# Optimizer statistics
+
+Every Senzing SDK statement is a key lookup or key-driven write with bind variables, and the tables start empty
+and grow by orders of magnitude during a load. Oracle's defaults are tuned for the opposite case. Apply this
+section to **every** database the engine connects to — every node of a multi-node datastore.
+
+## ⭐ No histograms on the Senzing schema
+
+**Tables:** all, most visibly `RES_FEAT_EKEY` (`LIB_FEAT_ID`). The engine's candidate lookup,
+`SELECT ... FROM RES_FEAT_EKEY WHERE LIB_FEAT_ID IN (:0 ... :31) AND RES_ENT_ID != :32`, is the hottest
+statement during a load.
+
+**Mechanism.** Oracle's automatic statistics (`METHOD_OPT` default `FOR ALL COLUMNS SIZE AUTO`) build a histogram
+on `LIB_FEAT_ID` once some features are shared by many entities. When the cursor is hard parsed, Oracle peeks at
+the bind values; if they fall on histogram-"popular" ids the estimate jumps and the plan becomes a
+`TABLE ACCESS FULL`. That plan is then shared by every execution, and its cost grows with the table, so
+throughput falls continuously as the load proceeds. In our testing, Oracle did not move the cursor off that plan
+on its own while the load ran. The ids are generated keys, so the "popularity" carries no useful
+information; after the datastore is purged they even refer to different features.
+
+With identical statistics otherwise, the same statement with 32 non-popular ids produces
+`INLIST ITERATOR` → `INDEX RANGE SCAN RES_FEAT_EKEY_PK`.
+
+**Do this** (as a DBA, before loading; repeat for every node):
+
+```sql
+EXEC DBMS_STATS.SET_SCHEMA_PREFS('<SENZING_SCHEMA>', 'METHOD_OPT', 'FOR ALL COLUMNS SIZE 1');
+
+-- remove histograms already gathered
+BEGIN
+  FOR r IN (SELECT table_name, column_name FROM dba_tab_col_statistics
+            WHERE owner = '<SENZING_SCHEMA>' AND histogram <> 'NONE') LOOP
+    DBMS_STATS.DELETE_COLUMN_STATS('<SENZING_SCHEMA>', r.table_name, r.column_name,
+                                   col_stat_type => 'HISTOGRAM', no_invalidate => FALSE);
+  END LOOP;
+END;
+/
+```
+
+**Avoid:** fixing a single bad plan by flushing it from the shared pool. The next hard parse can peek
+popular ids again.
+
+**How to check:**
+
+```sql
+-- no histograms remain
+SELECT table_name, column_name, histogram FROM dba_tab_col_statistics
+WHERE owner = '<SENZING_SCHEMA>' AND histogram <> 'NONE';
+
+-- no Senzing statement is scanning a whole table while loading
+SELECT s.sql_id, p.object_name, s.executions,
+       ROUND(s.buffer_gets / NULLIF(s.executions, 0)) AS gets_per_exec
+FROM   v$sql s JOIN v$sql_plan p ON p.sql_id = s.sql_id AND p.child_number = s.child_number
+WHERE  s.parsing_schema_name = '<SENZING_SCHEMA>'
+AND    p.operation = 'TABLE ACCESS' AND p.options = 'FULL' AND p.object_owner = '<SENZING_SCHEMA>'
+ORDER  BY s.cpu_time DESC;
+```
+
+A full scan whose `gets_per_exec` rises over time is this problem. Both queries return no rows when the setting is
+in place.
+
+## Statistics gathered on near-empty tables _(provisional)_
+
+**Mechanism.** A plan is costed against the statistics present when it is parsed. Statistics gathered on an empty or
+nearly empty table — after a fresh schema or a purge, or by a maintenance-window job early in a load — make a full
+scan look cheapest. The plan stays until the statistics are regathered and the cursor invalidated, while the table
+grows far past the size it was costed for. We have seen this on `RES_REL_EKEY` (`DELETE ... WHERE (RES_ENT_ID,
+REL_ENT_ID, RES_REL_ID) IN (...)` and `SELECT ... WHERE RES_ENT_ID IN (...)`).
+
+The check above detects it. The fix being measured is to set representative statistics before loading and lock
+them (`DBMS_STATS.SET_TABLE_STATS` / `SET_INDEX_STATS`, then `DBMS_STATS.LOCK_SCHEMA_STATS`). This section will be
+updated with the confirmed recommendation.
+
+## Keep the maintenance-window resource plan out of a load
+
+Oracle's default maintenance windows (weeknights, and all of Saturday and Sunday) activate
+`DEFAULT_MAINTENANCE_PLAN`, which manages CPU and runs the automatic statistics job alongside the load. A load that
+spans a window boundary changes behavior partway through, and the statistics job can gather on tables that are
+still nearly empty (see above). Under the plan, sessions waiting for CPU show as `resmgr:cpu quantum`.
+
+**Do this** for a dedicated loading datastore, in the CDB and in the PDB:
+
+```sql
+ALTER SYSTEM SET resource_manager_plan = 'FORCE:' SCOPE = BOTH;
+```
+
+`FORCE:` with no plan name keeps the scheduler windows from switching plans. Set it back to your site's plan when
+the load is finished.
+
+**How to check:** `SELECT value FROM v$parameter WHERE name = 'resource_manager_plan';` returns `FORCE:`, and
+`resmgr:cpu quantum` does not appear among the top waits.
 
 ---
 
