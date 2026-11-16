@@ -41,6 +41,10 @@ _Added as levers are measured._
   `LOCK_SCHEMA_STATS`; they need only say the tables are large. [Details](#-load-with-representative-statistics-locked)
 - ⭐ **Spread the network interrupts across all sockets.** [Details](#spread-the-network-interrupts-across-all-processor-sockets)
 - **Keep the maintenance-window resource plan out of a load.** [Details](#keep-the-maintenance-window-resource-plan-out-of-a-load)
+- **Pre-size undo, and let it grow in large steps.** [Details](#pre-size-undo-and-let-it-grow-in-large-steps)
+- **Split memory between instances by measured benefit** when the datastore spans several instances on one host.
+  [Details](#split-memory-between-instances-by-measured-benefit-provisional)
+- **Reserve 1 GiB huge pages before host memory fragments.** [Details](#6-reserve-1-gib-huge-pages-before-host-memory-fragments)
 
 ---
 
@@ -203,6 +207,93 @@ the load is finished.
 
 ---
 
+# Memory and storage settings
+
+> [!NOTE]
+> The queries in this section read Active Session History (ASH) and the cache advisories. ASH and AWR require the
+> Oracle Diagnostics Pack licence.
+
+## Pre-size undo, and let it grow in large steps
+
+**Mechanism.** Every Senzing write transaction generates undo. Under a load with many concurrent writers the undo
+tablespace grows quickly, and each time its data file must extend, the sessions that need new undo space queue
+behind the extension on `enq: HW - contention`. Data files created with a small autoextend step (a few MB) extend
+very often, so the queueing recurs throughout the load. A large step makes extensions rare but does not remove
+them, and each larger extension takes longer: in our testing an undo tablespace on a 1 GB step that was still
+growing toward its working size still briefly queued the writers. Pre-sizing is what removes the waits; the large
+step is the fallback for growth beyond it.
+
+**Do this:** size the undo tablespace for a full load before loading (measure how large it grows on a
+representative load), and set a large autoextend step for anything beyond that. For a bigfile undo tablespace, in
+the PDB when local undo is on:
+
+```sql
+ALTER DATABASE DATAFILE '<undo datafile>' RESIZE <size>G;
+ALTER DATABASE DATAFILE '<undo datafile>' AUTOEXTEND ON NEXT 1G MAXSIZE UNLIMITED;
+```
+
+A smallfile data file cannot grow past about 32 GB with 8 KB blocks: for a smallfile undo tablespace, add data
+files (`ALTER TABLESPACE <undo tablespace> ADD DATAFILE ... SIZE ...G AUTOEXTEND ON NEXT 1G`) instead.
+
+**Avoid:** relying on autoextend alone during a load, and above all leaving the undo data file on a small autoextend
+step.
+
+**How to check:**
+
+```sql
+-- size and autoextend step of the undo data files
+SELECT f.file_name, ROUND(f.bytes/1073741824, 1) AS gb,
+       ROUND(f.increment_by * t.block_size / 1048576) AS next_mb, t.bigfile
+  FROM dba_data_files f JOIN dba_tablespaces t ON t.tablespace_name = f.tablespace_name
+ WHERE t.contents = 'UNDO';
+-- high-water-mark waits by tablespace over the last day (p2 is the tablespace number). The AWR copy of ASH keeps
+-- one sample in ten but covers a whole load; v$active_session_history covers only the most recent minutes.
+SELECT ts.name, COUNT(*) AS samples
+  FROM dba_hist_active_sess_history h
+  LEFT JOIN v$tablespace ts ON ts.ts# = h.p2 AND ts.con_id = h.con_id
+ WHERE h.event = 'enq: HW - contention' AND h.sample_time > SYSTIMESTAMP - INTERVAL '1' DAY
+ GROUP BY ts.name ORDER BY 2 DESC;
+```
+
+The undo tablespace should not appear in the second query while it stays within its pre-sized space.
+
+## Split memory between instances by measured benefit _(provisional)_
+
+**Mechanism.** The Senzing datastore can be split across several databases (for example the core tables in one,
+the feature tables in others), and when those run as several Oracle instances on one host they share one memory
+budget. Our testing so far shows the instances do not benefit equally from extra buffer cache, so an even split, or
+one by table size, can leave avoidable physical reads. _Provisional: we have measured the advice, not yet the effect
+of a re-split._
+
+**Do this:** after a representative load at scale, read `V$DB_CACHE_ADVICE` on each instance. Its estimates are
+cumulative since the instance started, so compare only instances that have been up over the same load. For each
+instance, take the reads (and read time) saved per extra GB just above the current size (`size_factor` 1), and move
+memory towards the instance where that saving is largest: set `sga_target` and `sga_max_size` in the SPFILE
+(`SCOPE=SPFILE`) and restart the container (see [section 5](#5-restart-with-the-container-not-with-shutdown--startup)).
+Keep the total within the reserved huge pages (see
+[section 6](#6-reserve-1-gib-huge-pages-before-host-memory-fragments)).
+
+**Avoid:** splitting by table size alone.
+
+**How to check:**
+
+```sql
+-- estimated physical reads and read time saved per extra GB at each candidate size (default 8 KB pool)
+SELECT ROUND(size_for_estimate / 1024, 1) AS size_gb, size_factor, estd_physical_reads, estd_physical_read_time,
+       ROUND((estd_physical_reads - LEAD(estd_physical_reads) OVER (ORDER BY size_for_estimate))
+             / ((LEAD(size_for_estimate) OVER (ORDER BY size_for_estimate) - size_for_estimate) / 1024)) AS reads_saved_per_gb,
+       ROUND((estd_physical_read_time - LEAD(estd_physical_read_time) OVER (ORDER BY size_for_estimate))
+             / ((LEAD(size_for_estimate) OVER (ORDER BY size_for_estimate) - size_for_estimate) / 1024)) AS read_s_saved_per_gb
+  FROM v$db_cache_advice
+ WHERE name = 'DEFAULT' AND block_size = 8192 AND advice_status = 'ON'
+ ORDER BY size_for_estimate;
+```
+
+Compare the `size_factor` 1 row across instances. After the next representative load, the instance that gained
+memory should show fewer physical reads (`physical reads` in `V$SYSSTAT`, or the AWR Load Profile) for the same work.
+
+---
+
 # Host settings for the database server
 
 ## Spread the network interrupts across all processor sockets
@@ -278,3 +369,29 @@ When a startup fails, the image's start script (`startDB.sh`) retries it with `S
 `ORA-03113: end-of-file on communication channel`.
 
 **Do this:** change parameters with `ALTER SYSTEM ... SCOPE=SPFILE`, then `docker restart` the container.
+
+## 6. Reserve 1 GiB huge pages before host memory fragments
+
+A 1 GiB huge page needs 1 GiB of contiguous physical memory. On a host that has been running for a while, memory
+is fragmented, and raising `vm.nr_hugepages` at that point fills only part of the request — without an error.
+Dropping caches and compacting memory did not recover the rest for us: memory the kernel cannot move still splits
+the free regions. The instances then start with part of the SGA on 4 KiB pages (`use_large_pages = TRUE`) unless the SGA is reduced to fit.
+
+**Do this:** reserve the 1 GiB huge pages at boot on the kernel command line (for example
+`default_hugepagesz=1G hugepagesz=1G hugepages=<n>`), or as early after boot as possible, before the page cache
+and other workloads have used the memory. Reserve enough for every instance's SGA plus a small margin.
+
+**Avoid:** expecting a runtime increase of `vm.nr_hugepages` on a busy host to reach the requested count, and
+letting part of an SGA fall back to 4 KiB pages: with thousands of database sessions, each process then maps that
+part of the SGA through its own page tables.
+
+**How to check:**
+
+```sh
+# pages actually reserved per NUMA node — compare with what you asked for
+grep -H . /sys/devices/system/node/node*/hugepages/hugepages-1048576kB/nr_hugepages
+grep -E 'HugePages_(Total|Free)' /proc/meminfo
+```
+
+and, after each instance starts, the large-page summary in the startup messages of its alert log shows the pages it
+expected and the pages it allocated: they should be equal.
