@@ -39,6 +39,7 @@ _Added as levers are measured._
   [Details](#-no-histograms-on-the-senzing-schema)
 - ⭐ **Load with representative statistics, locked.** Statistics from a sizeable sample load (or set by hand), then
   `LOCK_SCHEMA_STATS`; they need only say the tables are large. [Details](#-load-with-representative-statistics-locked)
+- ⭐ **Spread the network interrupts across all sockets.** [Details](#spread-the-network-interrupts-across-all-processor-sockets)
 - **Keep the maintenance-window resource plan out of a load.** [Details](#keep-the-maintenance-window-resource-plan-out-of-a-load)
 
 ---
@@ -199,6 +200,36 @@ the load is finished.
 
 **How to check:** `SELECT value FROM v$parameter WHERE name = 'resource_manager_plan';` returns `FORCE:`, and
 `resmgr:cpu quantum` does not appear among the top waits.
+
+---
+
+# Host settings for the database server
+
+## Spread the network interrupts across all processor sockets
+
+**Mechanism.** The Senzing SDK talks to the database in many small round trips over many connections. Each network
+interface queue raises its interrupts, and processes its packets, on the CPUs its interrupt is bound to. Without
+an interrupt balancer, network drivers commonly bind every queue to the CPUs of the socket (NUMA node) the card is
+attached to. The database threads serving those connections then crowd onto that socket: it runs out of CPU while the
+other socket idles. Oracle reports the queueing as I/O wait — `db file sequential read` averages several times the
+storage's own read latency.
+
+**Do this:** bind the interface's queue interrupts across the CPUs of **all** sockets, for example one queue per CPU
+(`/proc/irq/<n>/smp_affinity_list`, as root). The setting does not survive a reboot; apply it from the host's boot
+configuration. Do not assume `irqbalance` does this: it may keep a device's interrupts on the device's own node — check
+the result.
+
+**How to check:**
+
+```sh
+# per-socket CPU use: one node near 100% (with high %soft) while another is mostly idle is this problem
+mpstat -N ALL 5 1
+# which CPUs each queue interrupt is bound to
+for i in $(awk -F: '/<interface>/ {print $1}' /proc/interrupts); do cat /proc/irq/$i/effective_affinity_list; done
+```
+
+and compare Oracle's average `db file sequential read` (`V$SYSTEM_EVENT`) with the device read latency
+(`iostat -x`, `r_await`). After the change they should be close.
 
 ---
 

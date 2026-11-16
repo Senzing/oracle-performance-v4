@@ -19,6 +19,8 @@ traffic is on a separate interface and subnet.
 | Network | 10 GbE |
 | OS | Ubuntu 26.04.1 LTS, kernel 7.0 |
 | Containers | Docker 29.1.3 |
+| Network interrupts | `irqbalance` off; the interface's 119 queue interrupts bound one per CPU across **both** NUMA nodes (set at runtime — see the main page). Before this, the driver had bound all of them to the card's own node. |
+| NUMA | automatic NUMA balancing on (kernel default); huge pages split evenly across the two nodes |
 
 ## Application servers (Senzing SDK processes only)
 
