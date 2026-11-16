@@ -36,7 +36,7 @@ Each has a 10 GbE data-plane interface and runs Docker 29.1.3. In total: 120 cor
 | Component | Version / setting |
 |---|---|
 | Database | Oracle AI Database 26ai Enterprise Edition 23.26.1.0, the Oracle container image `container-registry.oracle.com/database/enterprise:23.26.1.0` |
-| Senzing | SENZING® SDK 4.5.0 (pre-release build) |
+| Senzing | SENZING® SDK 4.5.0 |
 | Loader | Senzing combined consumer: each process reads records from the broker, calls `add_record`, and also processes redo (`REDO_PERCENT` 20). 67 processes × 12 threads = 804 engine threads (18 + 18 + 31 processes across the three application servers). |
 | Message broker | Apache ActiveMQ Artemis 2.57.0, on the database server |
 | Test data | 100 million synthetic records, one data source, published to the broker as JSON |
