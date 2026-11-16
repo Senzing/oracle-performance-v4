@@ -37,9 +37,6 @@ _Added as levers are measured._
   [Details](#-no-histograms-on-the-senzing-schema)
 - ⭐ **Load with representative statistics, locked.** Statistics from a sizeable sample load (or set by hand), then
   `LOCK_SCHEMA_STATS`; they need only say the tables are large. [Details](#-load-with-representative-statistics-locked)
-- ⭐ **Redo queue dequeue: `FIRST_ROWS(1)`.** Until the engine carries the hint, attach it with a SQL patch, or a
-  hard parse can leave every redo claim reading and sorting the whole queue.
-  [Details](#-redo-queue-dequeue-read-only-the-first-row)
 - **Keep the maintenance-window resource plan out of a load.** [Details](#keep-the-maintenance-window-resource-plan-out-of-a-load)
 
 ---
@@ -181,61 +178,6 @@ WHERE owner = '<SENZING_SCHEMA>' AND object_type = 'TABLE' ORDER BY num_rows DES
 ```
 
 shows non-trivial `NUM_ROWS` and `STATTYPE_LOCKED = 'ALL'` for the Senzing tables.
-
-## ⭐ Redo queue dequeue: read only the first row
-
-**Table:** `SYS_EVAL_QUEUE`. Statement:
-`SELECT MSG_ID, DSRC_CODE, ENT_SRC_KEY, MSG FROM SYS_EVAL_QUEUE WHERE MSG_ID > :1 ORDER BY MSG_ID FOR UPDATE SKIP LOCKED`.
-
-**Mechanism.** Each redo processor claims one message at a time, starting at a random point in the key range so that
-processors do not contend for the same row. The statement fetches a single row, but Oracle optimizes it for all rows.
-When the cursor is hard parsed, Oracle peeks at the start point: a low one makes most of the queue qualify, and the
-plan becomes `TABLE ACCESS FULL` + `SORT ORDER BY` of the whole queue. Every redo processor then shares that plan, and
-each claim reads and sorts the entire queue. Whether a given hard parse lands on that plan is luck, independent of the
-quality of the statistics. A `FETCH FIRST` or `ROWNUM` limit cannot be used instead: it is applied before
-`SKIP LOCKED`.
-
-A future engine release adds a `FIRST_ROWS(1)` hint to the statement. Until then, attach the hint with a SQL patch.
-
-**Do this** (as a DBA, in the database or pluggable database the engine connects to; every node that holds
-`SYS_EVAL_QUEUE`). Find the statement after the engine has run redo once:
-
-```sql
-SELECT DISTINCT sql_id FROM v$sql
-WHERE  sql_text LIKE 'SELECT MSG_ID,DSRC_CODE,ENT_SRC_KEY,MSG FROM %SYS_EVAL_QUEUE WHERE MSG_ID>%SKIP LOCKED%';
-```
-
-then patch it and remove the cached plan:
-
-```sql
-DECLARE n VARCHAR2(128);
-BEGIN
-  n := DBMS_SQLDIAG.CREATE_SQL_PATCH(sql_id => '<SQL_ID>', hint_text => 'FIRST_ROWS(1)',
-                                     name => 'SENZING_EVAL_QUEUE_DEQUEUE');
-END;
-/
-BEGIN
-  FOR c IN (SELECT DISTINCT address, hash_value FROM v$sqlarea WHERE sql_id = '<SQL_ID>') LOOP
-    DBMS_SHARED_POOL.PURGE(c.address || ',' || c.hash_value, 'C');
-  END LOOP;
-END;
-/
-```
-
-The patch matches the statement text, so it survives restarts and purges and applies to every later hard parse.
-
-**How to check:**
-
-```sql
-SELECT name, status FROM dba_sql_patches;
-
-SELECT s.child_number, s.plan_hash_value, s.executions,
-       ROUND(s.buffer_gets / NULLIF(s.executions, 0)) AS gets_per_exec, s.sql_patch
-FROM   v$sql s WHERE s.sql_id = '<SQL_ID>';
-```
-
-Every child shows the patch name, and `gets_per_exec` stays in single digits however large the queue grows. The plan
-(`DBMS_XPLAN.DISPLAY_CURSOR('<SQL_ID>')`) is an `INDEX RANGE SCAN` of the queue's primary key, with no `SORT ORDER BY`.
 
 ## Keep the maintenance-window resource plan out of a load
 
