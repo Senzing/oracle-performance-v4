@@ -26,6 +26,8 @@ with the checks given.
 > **Work in progress.** This page is being written as our Oracle v4 testing proceeds. Sections are added once a
 > finding is confirmed from an empty datastore; provisional findings are called out as such.
 
+The hardware, operating systems and software we tested on are in [TEST_ENVIRONMENT.md](TEST_ENVIRONMENT.md).
+
 ⭐ marks a lever that made a large difference in our own v4 testing.
 
 ## At a glance — the key levers
