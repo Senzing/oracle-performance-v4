@@ -41,6 +41,9 @@ _Added as levers are measured._
 - ⭐ **Load with representative statistics, locked.** Statistics from a sizeable sample load (or set by hand), then
   `LOCK_SCHEMA_STATS`; they need only say the tables are large. [Details](#-load-with-representative-statistics-locked)
 - ⭐ **Spread the network interrupts across all sockets.** [Details](#spread-the-network-interrupts-across-all-processor-sockets)
+- **Store short text columns as `VARCHAR2`, not `CLOB`.** `LIB_FEAT.FELEM_VALUES` as a CLOB is stored as UTF-16 in an
+  `AL32UTF8` database, which makes the largest feature table substantially bigger.
+  [Details](#store-short-text-columns-as-varchar2-not-clob)
 - **Keep the maintenance-window resource plan out of a load.** [Details](#keep-the-maintenance-window-resource-plan-out-of-a-load)
 - **Pre-size undo, and let it grow in large steps.** [Details](#pre-size-undo-and-let-it-grow-in-large-steps)
 - **Split memory between instances by measured benefit** when the datastore spans several instances on one host.
@@ -76,6 +79,49 @@ ALTER TABLE RES_ENT ADD FEATURES CLOB;
 
 ```sql
 SELECT RES_ENT_ID FROM RES_ENT WHERE FEATURES IS NOT NULL FETCH FIRST 5 ROWS ONLY;
+```
+
+## Store short text columns as `VARCHAR2`, not `CLOB`
+
+**Mechanism.** The standard Oracle schema declares several short text columns as `CLOB`. The values are short, so
+they are stored in the row, but in a multibyte database character set such as `AL32UTF8` Oracle stores CLOB text as
+UTF-16. That takes two bytes for every ASCII character, plus a LOB header per value. `LIB_FEAT.FELEM_VALUES` is in
+every `LIB_FEAT` row, and `LIB_FEAT` is the largest feature table, so the CLOB encoding makes the table substantially
+larger. Fewer rows then fit in each block and in the buffer cache, and a lookup that misses the cache reads more
+blocks. The client also handles each CLOB value through a LOB locator rather than as a plain string. Table
+compression does not remove this cost. Changing the character set does not either: only the column type does.
+
+**Do this:** before creating the schema, edit the schema creation script so these columns are `VARCHAR2(4000)`
+instead of `CLOB`:
+
+| Table | Column |
+|---|---|
+| `LIB_FEAT` | `FELEM_VALUES` |
+| `SYS_HW_CHECK` | `FELEM_VALUES` |
+| `RES_ENT_OKEY` | `MATCH_KEY` |
+| `RES_RELATE` | `MATCH_KEY` |
+
+Leave the other `CLOB` columns as they are, including `RES_ENT.FEATURES`. Their values can be long.
+
+`VARCHAR2(4000)` holds 4000 **bytes** under the default `MAX_STRING_SIZE = STANDARD`. The engine sets no length
+limit of its own on these columns, so confirm that your data stays well under it: load a representative sample with
+the standard schema and check the longest values (query below). We applied this change when creating the schema; we
+have not tested converting a datastore that is already loaded.
+
+**Avoid:** keeping `LIB_FEAT.FELEM_VALUES` as `CLOB` on a datastore you expect to grow large.
+
+**How to check:**
+
+```sql
+-- the four columns are VARCHAR2
+SELECT table_name, column_name, data_type, data_length
+  FROM user_tab_columns
+ WHERE (table_name, column_name) IN (('LIB_FEAT','FELEM_VALUES'), ('SYS_HW_CHECK','FELEM_VALUES'),
+                                     ('RES_ENT_OKEY','MATCH_KEY'), ('RES_RELATE','MATCH_KEY'));
+-- longest values in bytes, on a representative sample load (full scans: run them on a sample, not a live load)
+SELECT MAX(LENGTHB(FELEM_VALUES)) FROM LIB_FEAT;
+SELECT MAX(LENGTHB(MATCH_KEY)) FROM RES_ENT_OKEY;
+SELECT MAX(LENGTHB(MATCH_KEY)) FROM RES_RELATE;
 ```
 
 ---
@@ -247,8 +293,10 @@ SELECT f.file_name, ROUND(f.bytes/1073741824, 1) AS gb,
        ROUND(f.increment_by * t.block_size / 1048576) AS next_mb, t.bigfile
   FROM dba_data_files f JOIN dba_tablespaces t ON t.tablespace_name = f.tablespace_name
  WHERE t.contents = 'UNDO';
--- high-water-mark waits by tablespace over the last day (p2 is the tablespace number). The AWR copy of ASH keeps
--- one sample in ten but covers a whole load; v$active_session_history covers only the most recent minutes.
+-- high-water-mark waits by tablespace over the last day (p2 is the tablespace number). The AWR copy of ASH covers a
+-- whole load but keeps only one sample in ten, so it can miss a burst of a few minutes entirely. Run the same query
+-- on v$active_session_history (no sample_time filter) as well, while the instance's recent history still covers
+-- the start of the load, when undo grows fastest.
 SELECT ts.name, COUNT(*) AS samples
   FROM dba_hist_active_sess_history h
   LEFT JOIN v$tablespace ts ON ts.ts# = h.p2 AND ts.con_id = h.con_id
