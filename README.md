@@ -137,6 +137,16 @@ ALTER TABLE RES_ENT_OKEY MODIFY (MATCH_KEY    VARCHAR2(32767));
 ALTER TABLE RES_RELATE   MODIFY (MATCH_KEY    VARCHAR2(32767));
 ```
 
+How the column is widened decides where Oracle stores a long value:
+
+- **Widened with `ALTER TABLE ... MODIFY`** (above): the column has no LOB segment. Every value stays in the row, as a
+  `VARCHAR2(4000)` value does. A value larger than a database block becomes a chained row, which costs one extra block
+  read when it is fetched.
+- **Declared `VARCHAR2(32767)` in `CREATE TABLE`**: Oracle adds a hidden SecureFiles LOB segment for the column, which
+  appears in `USER_LOBS`.
+
+Values over 4000 bytes are rare in these columns, so either form costs little. We measured the first.
+
 **Avoid:**
 
 - keeping `LIB_FEAT.FELEM_VALUES` as `CLOB` on a datastore you expect to grow large;
