@@ -94,7 +94,7 @@ larger. Fewer rows then fit in each block and in the buffer cache, and a lookup 
 blocks. The client also handles each CLOB value through a LOB locator rather than as a plain string. Table
 compression does not remove this cost. Changing the character set does not either: only the column type does.
 
-**Do this:** before creating the schema, edit the schema creation script so these columns are `VARCHAR2(32767)`
+**Do this:** before creating the schema, edit the schema creation script so these columns are `VARCHAR2(4000)`
 instead of `CLOB`:
 
 | Table | Column |
@@ -127,7 +127,8 @@ ALTER PLUGGABLE DATABASE <pdb> OPEN;
 @?/rdbms/admin/utlrp.sql
 ```
 
-Then create the schema and widen the four columns before loading, which is the configuration we measured:
+Then create the schema (with the `VARCHAR2(4000)` columns above) and widen the four columns before loading. This is the
+configuration we measured:
 
 ```sql
 ALTER TABLE LIB_FEAT     MODIFY (FELEM_VALUES VARCHAR2(32767));
