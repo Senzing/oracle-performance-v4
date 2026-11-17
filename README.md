@@ -110,8 +110,8 @@ Leave the other `CLOB` columns as they are, including `RES_ENT.FEATURES`. Their 
 `MAX_STRING_SIZE = STANDARD`, a `VARCHAR2` holds at most 4000 **bytes**. The engine sets no length limit of its own on
 these columns. On a large, varied dataset, a small number of `LIB_FEAT.FELEM_VALUES` values came out just over 4000
 bytes. Each one failed its insert with `ORA-12899: value too large for column`, and every loader that met one stopped.
-A sample load does not reliably find these values, because they are rare. Under `EXTENDED`, a value up to 4000 bytes is
-still stored in the row. Only the rare longer value is stored out of line.
+A sample load does not reliably find these values, because they are rare. `MAX_STRING_SIZE = EXTENDED` raises the
+`VARCHAR2` limit to 32767 bytes. Without it, a `VARCHAR2(32767)` column cannot be declared.
 
 Set `MAX_STRING_SIZE = EXTENDED` in the database (for a multitenant datastore, in each PDB) **before** creating the
 schema. This is Oracle's documented procedure. The change cannot be reversed:
@@ -127,7 +127,14 @@ ALTER PLUGGABLE DATABASE <pdb> OPEN;
 @?/rdbms/admin/utlrp.sql
 ```
 
-Then create the schema with the four columns as `VARCHAR2(32767)`.
+Then create the schema and widen the four columns before loading, which is the configuration we measured:
+
+```sql
+ALTER TABLE LIB_FEAT     MODIFY (FELEM_VALUES VARCHAR2(32767));
+ALTER TABLE SYS_HW_CHECK MODIFY (FELEM_VALUES VARCHAR2(32767));
+ALTER TABLE RES_ENT_OKEY MODIFY (MATCH_KEY    VARCHAR2(32767));
+ALTER TABLE RES_RELATE   MODIFY (MATCH_KEY    VARCHAR2(32767));
+```
 
 **Avoid:**
 
