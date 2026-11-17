@@ -66,6 +66,19 @@ uses `LEASE`.
 connects to the datastore, so that the lock mode recorded in the datastore is unambiguous. All processes on
 one datastore must use the same lock mode.
 
+It is not a datastore or `SYS_CFG` setting. It goes in the `ER` section of the engine settings JSON: the settings string
+passed to `SzAbstractFactory` / `SzEnvironment`, usually through `SENZING_ENGINE_CONFIGURATION_JSON`.
+
+```json
+{
+  "PIPELINE": { "...": "..." },
+  "SQL": { "CONNECTION": "oci://<user>:<password>@//<host>:1521/<service>" },
+  "ER": { "ENTITY_LOCK_MODE": "LEASE" }
+}
+```
+
+If `ENTITY_LOCK_MODE` is omitted, the engine defaults to `LEASE`. Setting it explicitly documents the intent.
+
 ## `RES_ENT.FEATURES` store _(v4.4+)_
 
 The engine's feature store on `RES_ENT` collapses the feature reads per record. The standard Oracle schema
