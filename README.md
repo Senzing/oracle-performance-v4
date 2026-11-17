@@ -59,25 +59,10 @@ _Added as levers are measured._
 
 ## Entity lock mode — LEASE
 
-Senzing's `ADVISORY` entity lock mode is implemented for PostgreSQL and SQL Server only. On Oracle the engine
-uses `LEASE`.
-
-**Do this:** set `ENTITY_LOCK_MODE` to `LEASE` explicitly in the engine configuration of **every** process that
-connects to the datastore, so that the lock mode recorded in the datastore is unambiguous. All processes on
-one datastore must use the same lock mode.
-
-It is not a datastore or `SYS_CFG` setting. It goes in the `ER` section of the engine settings JSON: the settings string
-passed to `SzAbstractFactory` / `SzEnvironment`, usually through `SENZING_ENGINE_CONFIGURATION_JSON`.
-
-```json
-{
-  "PIPELINE": { "...": "..." },
-  "SQL": { "CONNECTION": "oci://<user>:<password>@//<host>:1521/<service>" },
-  "ER": { "ENTITY_LOCK_MODE": "LEASE" }
-}
-```
-
-If `ENTITY_LOCK_MODE` is omitted, the engine defaults to `LEASE`. Setting it explicitly documents the intent.
+Senzing's entity lock mode is selected by `ENTITY_LOCK_MODE` in the `ER` section of the engine settings JSON (the
+settings string passed to `SzAbstractFactory` / `SzEnvironment`, usually `SENZING_ENGINE_CONFIGURATION_JSON`). Its
+`ADVISORY` option is implemented for PostgreSQL and SQL Server only. On Oracle the engine always uses `LEASE`,
+whatever the setting says, so there is nothing to configure.
 
 ## `RES_ENT.FEATURES` store _(v4.4+)_
 
