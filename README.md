@@ -41,8 +41,11 @@ _Added as levers are measured._
 - ⭐ **Load with representative statistics, locked.** Statistics from a sizeable sample load (or set by hand), then
   `LOCK_SCHEMA_STATS`; they need only say the tables are large. [Details](#-load-with-representative-statistics-locked)
 - ⭐ **Spread the network interrupts across all sockets.** [Details](#spread-the-network-interrupts-across-all-processor-sockets)
-- **Store short text columns as `VARCHAR2`, not `CLOB`.** `LIB_FEAT.FELEM_VALUES` as a CLOB is stored as UTF-16 in an
-  `AL32UTF8` database, which makes the largest feature table substantially bigger.
+- ⭐ **New repositories with Chinese, Japanese or Korean data: turn transliterated keys off.** Keep the translated keys.
+  [Details](#-new-repositories-with-chinese-japanese-or-korean-data-turn-transliterated-keys-off-v45)
+- **Store short text columns as `VARCHAR2(32767)` with `MAX_STRING_SIZE = EXTENDED`, not `CLOB`.**
+  `LIB_FEAT.FELEM_VALUES` as a CLOB is stored as UTF-16 in an `AL32UTF8` database, which makes the largest feature
+  table substantially bigger. `VARCHAR2(4000)` fails on the rare value over 4000 bytes.
   [Details](#store-short-text-columns-as-varchar2-not-clob)
 - **Keep the maintenance-window resource plan out of a load.** [Details](#keep-the-maintenance-window-resource-plan-out-of-a-load)
 - **Pre-size undo, and let it grow in large steps.** [Details](#pre-size-undo-and-let-it-grow-in-large-steps)
@@ -56,12 +59,10 @@ _Added as levers are measured._
 
 ## Entity lock mode — LEASE
 
-Senzing's `ADVISORY` entity lock mode is implemented for PostgreSQL and SQL Server only. On Oracle the engine
-uses `LEASE`.
-
-**Do this:** set `ENTITY_LOCK_MODE` to `LEASE` explicitly in the engine configuration of **every** process that
-connects to the datastore, so that the lock mode recorded in the datastore is unambiguous. All processes on
-one datastore must use the same lock mode.
+Senzing's entity lock mode is selected by `ENTITY_LOCK_MODE` in the `ER` section of the engine settings JSON (the
+settings string passed to `SzAbstractFactory` / `SzEnvironment`, usually `SENZING_ENGINE_CONFIGURATION_JSON`). Its
+`ADVISORY` option is implemented for PostgreSQL and SQL Server only. On Oracle the engine always uses `LEASE`,
+whatever the setting says, so there is nothing to configure.
 
 ## `RES_ENT.FEATURES` store _(v4.4+)_
 
@@ -103,17 +104,59 @@ instead of `CLOB`:
 
 Leave the other `CLOB` columns as they are, including `RES_ENT.FEATURES`. Their values can be long.
 
-`VARCHAR2(4000)` holds 4000 **bytes** under the default `MAX_STRING_SIZE = STANDARD`. The engine sets no length
-limit of its own on these columns, so confirm that your data stays well under it: load a representative sample with
-the standard schema and check the longest values (query below). We applied this change when creating the schema; we
-have not tested converting a datastore that is already loaded.
+**Make them `VARCHAR2(32767)` with `MAX_STRING_SIZE = EXTENDED`, not `VARCHAR2(4000)`.** Under the default
+`MAX_STRING_SIZE = STANDARD`, a `VARCHAR2` holds at most 4000 **bytes**. The engine sets no length limit of its own on
+these columns. On a large, varied dataset, a small number of `LIB_FEAT.FELEM_VALUES` values came out just over 4000
+bytes. Each one failed its insert with `ORA-12899: value too large for column`, and every loader that met one stopped.
+A sample load does not reliably find these values, because they are rare. `MAX_STRING_SIZE = EXTENDED` raises the
+`VARCHAR2` limit to 32767 bytes. Without it, a `VARCHAR2(32767)` column cannot be declared.
 
-**Avoid:** keeping `LIB_FEAT.FELEM_VALUES` as `CLOB` on a datastore you expect to grow large.
+Set `MAX_STRING_SIZE = EXTENDED` in the database (for a multitenant datastore, in each PDB) **before** creating the
+schema. This is Oracle's documented procedure. The change cannot be reversed:
+
+```sql
+ALTER SESSION SET CONTAINER = <pdb>;
+ALTER PLUGGABLE DATABASE <pdb> CLOSE IMMEDIATE;
+ALTER PLUGGABLE DATABASE <pdb> OPEN UPGRADE;
+ALTER SYSTEM SET MAX_STRING_SIZE = EXTENDED SCOPE = BOTH;
+@?/rdbms/admin/utl32k.sql
+ALTER PLUGGABLE DATABASE <pdb> CLOSE IMMEDIATE;
+ALTER PLUGGABLE DATABASE <pdb> OPEN;
+@?/rdbms/admin/utlrp.sql
+```
+
+Then create the schema (with the `VARCHAR2(4000)` columns above) and widen the four columns before loading. This is the
+configuration we measured:
+
+```sql
+ALTER TABLE LIB_FEAT     MODIFY (FELEM_VALUES VARCHAR2(32767));
+ALTER TABLE SYS_HW_CHECK MODIFY (FELEM_VALUES VARCHAR2(32767));
+ALTER TABLE RES_ENT_OKEY MODIFY (MATCH_KEY    VARCHAR2(32767));
+ALTER TABLE RES_RELATE   MODIFY (MATCH_KEY    VARCHAR2(32767));
+```
+
+How the column is widened decides where Oracle stores a long value:
+
+- **Widened with `ALTER TABLE ... MODIFY`** (above): the column has no LOB segment. Every value stays in the row, as a
+  `VARCHAR2(4000)` value does. A value larger than a database block becomes a chained row, which costs one extra block
+  read when it is fetched.
+- **Declared `VARCHAR2(32767)` in `CREATE TABLE`**: Oracle adds a hidden SecureFiles LOB segment for the column, which
+  appears in `USER_LOBS`.
+
+Values over 4000 bytes are rare in these columns, so either form costs little. We measured the first.
+
+**Avoid:**
+
+- keeping `LIB_FEAT.FELEM_VALUES` as `CLOB` on a datastore you expect to grow large;
+- `VARCHAR2(4000)` under `MAX_STRING_SIZE = STANDARD`. It works until the first value over 4000 bytes, which can arrive
+  hours into a load.
 
 **How to check:**
 
 ```sql
--- the four columns are VARCHAR2
+-- EXTENDED, in every database or PDB the engine connects to
+SELECT value FROM v$parameter WHERE name = 'max_string_size';
+-- the four columns are VARCHAR2(32767)
 SELECT table_name, column_name, data_type, data_length
   FROM user_tab_columns
  WHERE (table_name, column_name) IN (('LIB_FEAT','FELEM_VALUES'), ('SYS_HW_CHECK','FELEM_VALUES'),
@@ -122,6 +165,59 @@ SELECT table_name, column_name, data_type, data_length
 SELECT MAX(LENGTHB(FELEM_VALUES)) FROM LIB_FEAT;
 SELECT MAX(LENGTHB(MATCH_KEY)) FROM RES_ENT_OKEY;
 SELECT MAX(LENGTHB(MATCH_KEY)) FROM RES_RELATE;
+```
+
+## ⭐ New repositories with Chinese, Japanese or Korean data: turn transliterated keys off _(v4.5+)_
+
+**Mechanism.** For a name or address written in Chinese, Japanese or Korean script, SENZING® SDK 4.5 can build
+candidate keys from two romanized forms:
+
+- the **transliterated** form, a phonetic reading of the characters;
+- the **translated** form, an English rendering from the engine's gazetteer. For example, `三菱商事` becomes
+  "Mitsubishi".
+
+With both turned on, each such record carries both sets of keys. Composite keys such as `NAMEREGION_KEY` pair every
+name token with every city form, so their number grows faster than either set alone. The extra keys mean more
+candidates per record, more comparisons, and more rows written to and read from the key tables. In our testing,
+records in these scripts cost several times the CPU per record of Latin-script records.
+
+**Scope.** The setting has no effect on:
+
+- Latin or Cyrillic names, which produced exactly the same keys and cost with it on or off;
+- person names in any script, which keep their transliterated keys;
+- a name or address part the gazetteer cannot translate, which keeps its transliterated keys so that it is never left
+  without any.
+
+Only translated organization names and translated road and city names lose their transliterated keys.
+
+**Do this:** in a **new** repository whose data includes Chinese, Japanese or Korean names or addresses, set these in
+the `SETTINGS` section of the Senzing configuration before loading the first record:
+
+```json
+"NAME_TRANSLITERATED_KEYS": false,
+"ADDR_TRANSLITERATED_KEYS": false,
+"NAME_TRANSLATED_KEYS": true,
+"ADDR_TRANSLATED_KEYS": true
+```
+
+A setting that is absent counts as `true`. The engine refuses a configuration with both `NAME_*` settings `false`.
+On the same records, turning transliterated keys off cut the CPU and the number of candidates per CJK record to about
+a third.
+
+**Avoid:**
+
+- changing the setting on a repository that is already loaded. Records already loaded keep the keys they were given.
+  We have not measured a mixed repository.
+- turning the translated keys off instead. The translated form is the one that matches the same organization written
+  in English.
+
+**How to check:** the configuration in use carries the settings:
+
+```sql
+SELECT CONFIG_DATA_ID,
+       JSON_VALUE(CONFIG_DATA, '$.G2_CONFIG.SETTINGS.NAME_TRANSLITERATED_KEYS') AS name_transliterated,
+       JSON_VALUE(CONFIG_DATA, '$.G2_CONFIG.SETTINGS.ADDR_TRANSLITERATED_KEYS') AS addr_transliterated
+  FROM SYS_CFG;
 ```
 
 ---
